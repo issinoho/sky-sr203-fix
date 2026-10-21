@@ -44,7 +44,7 @@ specific method? See the full options below.
 
 ## Why does this happen?
 
-It's **two firmware bugs stacked on top of each other** — neither is a fault with your
+It's **a few firmware bugs stacked on top of each other** — none is a fault with your
 hardware, and nothing is actually wrong with your "session":
 
 1. **Malformed HTTP responses.** When you save a security change, the router's
@@ -59,11 +59,13 @@ hardware, and nothing is actually wrong with your "session":
    the newest value of. If anything re-renders a page between loading the form and
    submitting it (a background status poll, a second browser tab), your token is stale
    and the server returns the "Session expired" page — which then reloads the form
-   with a fresh token, which is why a **retry often works**.
+   with a fresh token, which is why a **retry often works**. On some pages (the
+   firewall-rules pages) the token can even go stale in ways that are hard to predict.
 
-Browsers used to tolerate both behaviours; as they tightened up, the bug became
-visible. **Both fixes in this repo address both bugs.** For the gory details see
-[How it works](#how-it-works).
+Browsers used to tolerate the old behaviours; as they tightened up, the bugs became
+visible. The proxy addresses all of this — repairing the HTTP/0.9 replies, keeping the
+token fresh, and, as a catch-all, **automatically resubmitting with a fresh token** if a
+save still comes back "expired". For the gory details see [How it works](#how-it-works).
 
 **Affected model:** developed and verified on the **SR203**. Other Sky Hubs that use
 the same `sky_router` web firmware may behave identically — reports welcome (open an
@@ -74,9 +76,10 @@ issue).
 ## Option A — The Proxy (recommended)
 
 The proxy sits between your browser and the router. It forwards everything unchanged
-except that it **repairs the malformed HTTP/0.9 replies** and **stamps the freshest
-`sessionKey` onto your saves** — so the web UI behaves normally. Your router login
-(HTTP Digest) passes straight through; **the proxy never sees or stores your password.**
+except that it **repairs the malformed HTTP/0.9 replies**, **stamps the freshest
+`sessionKey` onto your saves**, and **auto-resubmits with a fresh token** if a save still
+comes back "expired" — so the web UI behaves normally. Your router login (HTTP Digest)
+passes straight through; **the proxy never sees or stores your password.**
 
 Run it whichever way suits your setup:
 
@@ -115,6 +118,8 @@ first time.
 | `PROXY_PORT` | `8099` | Port to reach the proxy on (`http://<host>:PROXY_PORT/`) |
 | `ROUTER_ADDR` | `192.168.0.1:80` | Your Sky Hub's address (the default for Sky) |
 | `FIX_SESSIONKEY` | `1` | Stamp the fresh session token onto saves (leave on) |
+| `RETRY_EXPIRED` | `1` | Auto-resubmit a save that still returns "expired" (leave on) |
+| `DEBUG` | `0` | Set to `1` to log per-request token decisions to the container logs |
 
 Manage it with:
 ```bash
@@ -151,8 +156,9 @@ sudo systemctl disable --now sr203-proxy   # stop & don't start on boot
 ```
 
 **Configuration** lives in the unit file (`/etc/systemd/system/sr203-proxy.service`):
-edit the `Environment=` lines for `SR203_LISTEN`, `SR203_TARGET`, `SR203_FIX_SESSIONKEY`
-and the `WorkingDirectory`/`ExecStart` paths, then `sudo systemctl daemon-reload &&
+edit the `Environment=` lines for `SR203_LISTEN`, `SR203_TARGET`, `SR203_FIX_SESSIONKEY`,
+`SR203_RETRY_EXPIRED`, `SR203_DEBUG` and the `WorkingDirectory`/`ExecStart` paths, then
+`sudo systemctl daemon-reload &&
 sudo systemctl restart sr203-proxy`. The shipped unit is hardened (runs as a
 `DynamicUser`, no privileges, read-only filesystem). If you set a listen **port below
 1024**, see the comment in the unit about `CAP_NET_BIND_SERVICE`.
@@ -173,7 +179,8 @@ Browse to `http://<that-machine-ip>:8099/`. Press `Ctrl-C` to stop.
 
 Options (all three run modes accept these): `--listen HOST:PORT` (default
 `127.0.0.1:8099`), `--target HOST:PORT` (default `192.168.0.1:80`), or the env vars
-`SR203_LISTEN` / `SR203_TARGET` / `SR203_FIX_SESSIONKEY`.
+`SR203_LISTEN` / `SR203_TARGET` / `SR203_FIX_SESSIONKEY` / `SR203_RETRY_EXPIRED` /
+`SR203_DEBUG`.
 
 ### Verifying it works
 
@@ -264,9 +271,12 @@ SR203 is `admin`.
 
 ## Troubleshooting
 
-- **"Session expired" still appears once, then works.** You're likely running an older
-  build of the proxy — rebuild/redeploy (`docker compose up -d --build`) and hard-
-  refresh the browser to clear a cached form page.
+- **"Session expired" still appears.** Almost always an old build — the current proxy
+  auto-retries and shouldn't surface it. Check which build is running:
+  `curl -sI http://<host>:8099/ | grep -i version` (shows `X-SR203-Proxy-Version`), then
+  redeploy (`docker compose up -d --build --force-recreate`) and hard-refresh the
+  browser. If it persists on a page, set `DEBUG=1`, reproduce, and open an issue with the
+  `[sr203]` log lines (they contain only numeric tokens, no password).
 - **Browser can't reach the proxy.** Check the host's firewall allows the port, and
   that you started it with `--listen 0.0.0.0:8099` (not `127.0.0.1`) if browsing from
   another device.
