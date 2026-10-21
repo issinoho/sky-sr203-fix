@@ -1,0 +1,58 @@
+name: Bug report
+description: Something isn't working with the proxy or the script
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ⚠️ **Do NOT paste your router admin password, Wi-Fi key, or device serial number.**
+        Redact logs before posting (replace real values with `xxxxx`).
+  - type: input
+    id: model
+    attributes:
+      label: Hub model
+      description: On the sticker, e.g. SR203.
+      placeholder: SR203
+    validations:
+      required: true
+  - type: dropdown
+    id: tool
+    attributes:
+      label: Which tool / run mode?
+      options:
+        - Proxy — Docker
+        - Proxy — systemd
+        - Proxy — foreground (python3)
+        - Script (sr203.sh)
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what actually happened.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Started the proxy with ...
+        2. Browsed to ...
+        3. Changed ... and clicked Apply
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (redacted)
+      description: "`docker compose logs` or `journalctl -u sr203-proxy`. Remove any secrets."
+      render: text
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have removed my password, Wi-Fi key, and serial number from this report.
+          required: true

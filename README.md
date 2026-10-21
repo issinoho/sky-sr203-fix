@@ -25,6 +25,23 @@ anywhere.
 
 ---
 
+## Quick install (proxy)
+
+On a Linux box or Raspberry Pi on your network, this clones the repo and starts the
+proxy via **Docker** or **systemd** automatically:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/issinoho/sky-sr203-fix/main/install.sh | bash
+```
+
+Then browse to `http://<that-host-ip>:8099/`. Prefer to do it by hand, or pick a
+specific method? See the full options below.
+
+> 🔍 Good habit: read any `curl … | bash` script first —
+> [`install.sh`](install.sh) only clones this repo and starts the proxy.
+
+---
+
 ## Why does this happen?
 
 It's **two firmware bugs stacked on top of each other** — neither is a fault with your

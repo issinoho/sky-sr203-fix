@@ -1,0 +1,52 @@
+name: Compatibility report
+description: Report whether this works on your Sky Hub model (especially non-SR203)
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing! Reports of **success or failure** are equally useful.
+        ⚠️ **Do NOT paste your password, Wi-Fi key, or serial number.**
+  - type: input
+    id: model
+    attributes:
+      label: Hub model
+      description: The model number on the sticker.
+      placeholder: e.g. SR203 / SR213 / ...
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Did it fix the "Session expired" error?
+      options:
+        - "Yes — works"
+        - "Partly — works sometimes / needs a retry"
+        - "No — still broken"
+        - "N/A — my hub doesn't have this bug"
+    validations:
+      required: true
+  - type: input
+    id: banner
+    attributes:
+      label: Server banner
+      description: "Output of: curl -sI http://192.168.0.1/ | grep -i server"
+      placeholder: "Server: sky_router"
+  - type: input
+    id: uiver
+    attributes:
+      label: Web UI version
+      description: Shown in the page source/footer, e.g. the "<!-- v4.2 -->" comment.
+      placeholder: v4.2
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything else — which tool/mode you used, quirks, etc.
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have removed my password, Wi-Fi key, and serial number from this report.
+          required: true

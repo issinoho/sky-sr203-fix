@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Sky Community forum
+    url: https://helpforum.sky.com/
+    about: General Sky Broadband questions (this repo is a community workaround, not official Sky support).
