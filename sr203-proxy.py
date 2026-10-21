@@ -26,7 +26,7 @@ import socket
 import sys
 import threading
 
-__version__ = "1.3.0"  # bump on release; shown at startup and in X-SR203-Proxy-Version
+__version__ = "1.4.0"  # bump on release; shown at startup and in X-SR203-Proxy-Version
 
 BUFSZ = 65536
 
@@ -36,8 +36,15 @@ BUFSZ = 65536
 # page. Since all router traffic flows through this proxy, we track the freshest key
 # the server has emitted and stamp it onto outgoing POSTs, closing the race.
 FIX_SESSIONKEY = os.environ.get("SR203_FIX_SESSIONKEY", "1") not in ("0", "false", "no")
+DEBUG = os.environ.get("SR203_DEBUG", "0") not in ("0", "false", "no")
 _LAST_KEY = None
 _LAST_KEY_LOCK = threading.Lock()
+
+
+def dbg(*a):
+    if DEBUG:
+        sys.stderr.write("[sr203] " + " ".join(str(x) for x in a) + "\n")
+        sys.stderr.flush()
 # The token appears in three forms depending on the page:
 #   - a JS variable:  var sessionID = '12345';   (firewall-rules pages; the hidden
 #     field there is just a value="0" placeholder the JS overwrites at submit)
@@ -62,6 +69,7 @@ def _note_server_key(body):
         with _LAST_KEY_LOCK:
             global _LAST_KEY
             _LAST_KEY = cands[-1]
+        dbg("learned sessionKey", _LAST_KEY.decode(), "candidates=", [c.decode() for c in cands])
 
 
 def recv_http_message(sock, is_request):
@@ -228,11 +236,16 @@ def maybe_fix_sessionkey(req_head, req_body):
         return req_head, req_body
     with _LAST_KEY_LOCK:
         key = _LAST_KEY
+    orig = _KEY_IN_BODY.search(req_body)
     if not key or key == b"0":
+        dbg("POST sessionKey in body =", orig.group().decode() if orig else "none",
+            "| LAST_KEY =", key.decode() if key else "none", "| NOT stamping")
         return req_head, req_body  # never stamp a placeholder over a good token
     new_body = _KEY_IN_BODY.sub(b"sessionKey=" + key, req_body)
     if new_body != req_body:
         req_head = set_content_length(req_head, len(new_body))
+    dbg("POST sessionKey in body =", orig.group().decode() if orig else "none",
+        "| stamped LAST_KEY =", key.decode(), "| changed =", new_body != req_body)
     return req_head, new_body
 
 
@@ -264,6 +277,8 @@ def handle_client(client, target_host, target_port):
         req_head, req_body, _ = recv_http_message(client, is_request=True)
         if not req_head:
             return
+        if DEBUG:
+            dbg(">>", req_head.split(b"\r\n", 1)[0].decode(errors="replace"))
         req_head = rewrite_request_head(req_head, target_host)
         req_head, req_body = maybe_fix_sessionkey(req_head, req_body)
         # Always forward with explicit Content-Length framing (head rewrite stripped
@@ -275,6 +290,9 @@ def handle_client(client, target_host, target_port):
         with socket.create_connection((target_host, target_port), timeout=20) as upstream:
             upstream.sendall(req_head + req_body)
             resp_head, resp_body, is09 = recv_http_message(upstream, is_request=False)
+
+        if DEBUG and b"Session expired" in resp_body:
+            dbg("<< response was a SESSION EXPIRED page")
 
         # Learn the freshest sessionKey the server hands out (form page or refresh URL).
         _note_server_key(resp_body)
