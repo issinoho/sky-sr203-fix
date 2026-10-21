@@ -26,7 +26,7 @@ import socket
 import sys
 import threading
 
-__version__ = "1.4.0"  # bump on release; shown at startup and in X-SR203-Proxy-Version
+__version__ = "1.5.0"  # bump on release; shown at startup and in X-SR203-Proxy-Version
 
 BUFSZ = 65536
 
@@ -45,6 +45,35 @@ def dbg(*a):
     if DEBUG:
         sys.stderr.write("[sr203] " + " ".join(str(x) for x in a) + "\n")
         sys.stderr.flush()
+
+
+# Redact credential-bearing fields before logging a request body.
+_REDACT = re.compile(
+    rb'(?i)((?:[a-z0-9_]*passw[a-z0-9_]*|inorgpassword|inconfirmpasswd|wlwpapsk|wlkeytext|wlkeys|wlradiuskey)=)[^&\r\n]*'
+)
+
+
+def _redact(body):
+    return _REDACT.sub(rb'\1<redacted>', body or b"")
+
+
+def _header(head, name):
+    """Return the value of a header from a raw head block, or '' if absent."""
+    pat = name.lower().encode() + b":"
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(pat):
+            return line.split(b":", 1)[1].strip().decode(errors="replace")
+    return ""
+
+
+def _auth_summary(head):
+    """Summarise the Digest Authorization (nonce + nc) without leaking the response hash."""
+    a = _header(head, "authorization")
+    if not a:
+        return "none"
+    nonce = re.search(r'nonce="([^"]*)"', a)
+    nc = re.search(r"nc=([0-9a-f]+)", a)
+    return f"nonce={nonce.group(1)[:8] if nonce else '?'}… nc={nc.group(1) if nc else '?'}"
 # The token appears in three forms depending on the page:
 #   - a JS variable:  var sessionID = '12345';   (firewall-rules pages; the hidden
 #     field there is just a value="0" placeholder the JS overwrites at submit)
@@ -277,8 +306,17 @@ def handle_client(client, target_host, target_port):
         req_head, req_body, _ = recv_http_message(client, is_request=True)
         if not req_head:
             return
+        is_post = req_head.split(b" ", 1)[0].upper() == b"POST"
         if DEBUG:
             dbg(">>", req_head.split(b"\r\n", 1)[0].decode(errors="replace"))
+            if is_post:
+                dbg("   req headers:",
+                    "ctype=", _header(req_head, "content-type") or "-",
+                    "| referer=", _header(req_head, "referer") or "-",
+                    "| cookie=", _header(req_head, "cookie") or "-",
+                    "| xrw=", _header(req_head, "x-requested-with") or "-",
+                    "| auth:", _auth_summary(req_head))
+                dbg("   req body:", _redact(req_body).decode(errors="replace")[:1000])
         req_head = rewrite_request_head(req_head, target_host)
         req_head, req_body = maybe_fix_sessionkey(req_head, req_body)
         # Always forward with explicit Content-Length framing (head rewrite stripped
@@ -291,8 +329,12 @@ def handle_client(client, target_host, target_port):
             upstream.sendall(req_head + req_body)
             resp_head, resp_body, is09 = recv_http_message(upstream, is_request=False)
 
-        if DEBUG and b"Session expired" in resp_body:
-            dbg("<< response was a SESSION EXPIRED page")
+        if DEBUG and is_post:
+            expired = b"Session expired" in resp_body
+            dbg("<<", "SESSION EXPIRED" if expired else "ok",
+                "| status=", (resp_head.split(b"\r\n", 1)[0].decode(errors="replace") if resp_head else "HTTP/0.9"),
+                "| set-cookie=", _header(resp_head, "set-cookie") or "-")
+            dbg("   resp body:", resp_body.decode(errors="replace")[:400].replace("\n", " "))
 
         # Learn the freshest sessionKey the server hands out (form page or refresh URL).
         _note_server_key(resp_body)
