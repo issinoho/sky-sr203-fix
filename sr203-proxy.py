@@ -36,21 +36,30 @@ BUFSZ = 65536
 FIX_SESSIONKEY = os.environ.get("SR203_FIX_SESSIONKEY", "1") not in ("0", "false", "no")
 _LAST_KEY = None
 _LAST_KEY_LOCK = threading.Lock()
+# The token appears in three forms depending on the page:
+#   - a JS variable:  var sessionID = '12345';   (firewall-rules pages; the hidden
+#     field there is just a value="0" placeholder the JS overwrites at submit)
+#   - a hidden field: name="sessionKey" value="12345"   (block-sites, wireless, …)
+#   - a refresh URL:  ...?sessionKey=12345   (the "Session expired" page)
+# We must prefer the real value and IGNORE the "0" placeholder — learning "0" and
+# stamping it onto a POST is itself what breaks the firewall-rules pages.
+_KEY_IN_JS = re.compile(rb"sessionID\s*=\s*'(\d+)'")
 _KEY_IN_HTML = re.compile(rb'name="sessionKey"\s+value="(\d+)"', re.I)
 _KEY_IN_URL = re.compile(rb'[?&]sessionKey=(\d+)')
 _KEY_IN_BODY = re.compile(rb'sessionKey=\d+')
 
 
 def _note_server_key(body):
-    """Remember the most recent sessionKey the server emitted (from a form or a
-    refresh URL), so we can stamp it onto subsequent POSTs."""
+    """Remember the most recent *real* sessionKey the server emitted, so we can stamp
+    it onto subsequent POSTs. Placeholder zeros are ignored."""
     if not body:
         return
-    m = _KEY_IN_HTML.findall(body) or _KEY_IN_URL.findall(body)
-    if m:
+    cands = _KEY_IN_JS.findall(body) + _KEY_IN_HTML.findall(body) + _KEY_IN_URL.findall(body)
+    cands = [c for c in cands if c != b"0"]
+    if cands:
         with _LAST_KEY_LOCK:
             global _LAST_KEY
-            _LAST_KEY = m[-1]
+            _LAST_KEY = cands[-1]
 
 
 def recv_http_message(sock, is_request):
@@ -217,8 +226,8 @@ def maybe_fix_sessionkey(req_head, req_body):
         return req_head, req_body
     with _LAST_KEY_LOCK:
         key = _LAST_KEY
-    if not key:
-        return req_head, req_body
+    if not key or key == b"0":
+        return req_head, req_body  # never stamp a placeholder over a good token
     new_body = _KEY_IN_BODY.sub(b"sessionKey=" + key, req_body)
     if new_body != req_body:
         req_head = set_content_length(req_head, len(new_body))

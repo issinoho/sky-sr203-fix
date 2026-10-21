@@ -332,6 +332,12 @@ values the server emits and rewrites outgoing POSTs to carry the freshest one, c
 the race. The script achieves the same by fetching a fresh key immediately before each
 save.
 
+Note that some pages (the **firewall-rules** pages) carry the real token in a
+JavaScript variable (`var sessionID = '…'`) and leave the hidden field as a `value="0"`
+placeholder that the page's own JS fills in at submit time. The proxy understands this
+and ignores the `0` placeholder, so it learns and stamps the real token on those pages
+too.
+
 ### The proper fix
 
 The real defect is in the firmware: the write handlers should emit compliant HTTP
