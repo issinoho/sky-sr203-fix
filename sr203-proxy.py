@@ -89,25 +89,34 @@ def recv_http_message(sock, is_request):
     head += b"\r\n\r\n"
     body = rest
 
-    # Determine body length from Content-Length, else read to EOF (Connection: close).
+    # Determine framing from headers.
     content_length = None
+    chunked = False
     for line in head.split(b"\r\n"):
-        if line.lower().startswith(b"content-length:"):
+        low = line.lower()
+        if low.startswith(b"content-length:"):
             try:
                 content_length = int(line.split(b":", 1)[1].strip())
             except ValueError:
                 content_length = None
-            break
+        elif low.startswith(b"transfer-encoding:") and b"chunked" in low:
+            chunked = True
 
-    if content_length is not None:
+    if chunked:
+        # Dechunk so we hand the upstream a clean Content-Length body. A reverse
+        # proxy (e.g. nginx / Nginx Proxy Manager) in front of us may send request
+        # bodies chunked; the SR203's embedded server only understands
+        # Content-Length, so normalising here is what makes it work behind a proxy.
+        body = _read_chunked_body(sock, body)
+    elif content_length is not None:
         while len(body) < content_length:
             chunk = sock.recv(BUFSZ)
             if not chunk:
                 break
             body += chunk
     else:
-        # No Content-Length. Requests: assume no body unless present. Responses:
-        # read to EOF (router uses Connection: close).
+        # No explicit length. Requests: assume no body. Responses: read to EOF
+        # (the router delimits with Connection: close).
         if not is_request:
             while True:
                 chunk = sock.recv(BUFSZ)
@@ -118,12 +127,42 @@ def recv_http_message(sock, is_request):
     return head, body, False
 
 
+def _read_chunked_body(sock, buf):
+    """Decode an HTTP/1.1 chunked transfer-encoded body, reading more from sock as
+    needed. `buf` is whatever bytes were already read after the header block."""
+    out = b""
+    while True:
+        while b"\r\n" not in buf:
+            more = sock.recv(BUFSZ)
+            if not more:
+                return out
+            buf += more
+        size_line, _, buf = buf.partition(b"\r\n")
+        size_line = size_line.split(b";", 1)[0].strip()  # ignore chunk extensions
+        try:
+            n = int(size_line or b"0", 16)
+        except ValueError:
+            return out
+        if n == 0:
+            return out  # last chunk; ignore any trailers
+        while len(buf) < n + 2:  # chunk data + trailing CRLF
+            more = sock.recv(BUFSZ)
+            if not more:
+                break
+            buf += more
+        out += buf[:n]
+        buf = buf[n + 2:]
+
+
 def rewrite_request_head(head, target_host):
     """Rewrite headers for the picky SR203 parser.
 
     - Host: must be the router's address (it 400s on 'Host: 127.0.0.1:8099').
     - Force Connection: close (the firmware closes anyway).
     - Force identity encoding so bodies stay readable.
+    - Drop Transfer-Encoding and Content-Length; the caller re-adds a correct
+      Content-Length for the (already fully read / dechunked) body, so the SR203
+      always receives Content-Length framing even behind a reverse proxy.
     Digest auth is unaffected (it's computed over method + path, both preserved).
     """
     host_b = target_host.encode()
@@ -142,6 +181,8 @@ def rewrite_request_head(head, target_host):
             out.append(b"Connection: close")
         elif low.startswith(b"accept-encoding:"):
             out.append(b"Accept-Encoding: identity")  # avoid gzip so bodies stay readable
+        elif low.startswith(b"transfer-encoding:") or low.startswith(b"content-length:"):
+            continue  # re-added cleanly by set_content_length() when forwarding
         else:
             out.append(line)
     if not seen_host:
@@ -204,6 +245,11 @@ def handle_client(client, target_host, target_port):
             return
         req_head = rewrite_request_head(req_head, target_host)
         req_head, req_body = maybe_fix_sessionkey(req_head, req_body)
+        # Always forward with explicit Content-Length framing (head rewrite stripped
+        # any Transfer-Encoding / Content-Length). Only emit it when there's a body
+        # so plain GETs stay clean.
+        if req_body:
+            req_head = set_content_length(req_head, len(req_body))
 
         with socket.create_connection((target_host, target_port), timeout=20) as upstream:
             upstream.sendall(req_head + req_body)

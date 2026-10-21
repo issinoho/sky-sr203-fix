@@ -277,6 +277,21 @@ SR203 is `admin`.
 - **Script says "could not read sessionKey (auth problem?)".** Your netrc password is
   wrong, or the username isn't `admin`.
 
+### Running behind another reverse proxy (Nginx Proxy Manager, Traefik, Caddy…)
+
+Supported — put this proxy upstream of your usual reverse proxy and point your browser
+at the nice hostname. A few tips:
+
+- **Use a subdomain** (e.g. `sr203.yourdomain`), not a subpath (`/sr203/`). The router's
+  pages use root-relative URLs and HTTP Digest auth tied to the request path, so a
+  subpath mount breaks them.
+- In **Nginx Proxy Manager**: add a Proxy Host → Forward Hostname/IP = the machine
+  running `sr203-proxy`, Forward Port = `8099`, scheme `http`. Leave caching off.
+- This proxy **normalises request framing** (it dechunks `Transfer-Encoding: chunked`
+  bodies and forwards clean `Content-Length` to the router), which is what makes saves
+  work behind nginx — older builds showed "Session expired" here, so **rebuild/redeploy**
+  if you're upgrading.
+
 ---
 
 ## How it works
