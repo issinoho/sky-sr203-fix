@@ -1,0 +1,30 @@
+services:
+  sr203-proxy:
+    build: .
+    image: sr203-proxy:latest
+    container_name: sr203-proxy
+    restart: unless-stopped
+    # Publish the proxy on the docker host. Browse to
+    #   http://<docker-host-ip>:8099/   from any machine on your LAN.
+    ports:
+      - "${PROXY_PORT:-8099}:8099"
+    environment:
+      # Inside the container always listen on all interfaces.
+      SR203_LISTEN: "0.0.0.0:8099"
+      # The router to forward to.
+      SR203_TARGET: "${ROUTER_ADDR:-192.168.0.1:80}"
+      # Stamp the freshest sessionKey onto POSTs to kill the one-time "Session
+      # expired" race. On by default; set to 0 to disable.
+      SR203_FIX_SESSIONKEY: "${FIX_SESSIONKEY:-1}"
+    # Container must reach the router (192.168.0.1) on the LAN; default bridge
+    # networking via the host's route is sufficient. No extra_hosts needed.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "3"

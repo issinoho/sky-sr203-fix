@@ -1,0 +1,15 @@
+# NEVER commit credentials or local config
+.sr203_netrc
+.proxy_netrc
+*netrc*
+.netrc
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store
