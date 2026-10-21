@@ -26,6 +26,8 @@ import socket
 import sys
 import threading
 
+__version__ = "1.3.0"  # bump on release; shown at startup and in X-SR203-Proxy-Version
+
 BUFSZ = 65536
 
 # The SR203 rotates the per-form anti-CSRF "sessionKey" on every page render and only
@@ -242,9 +244,19 @@ def synth_http11(body):
         b"Content-Length: " + str(len(body)).encode() + b"\r\n"
         b"Connection: close\r\n"
         b"X-SR203-Proxy: upgraded-http0.9\r\n"
+        b"X-SR203-Proxy-Version: " + __version__.encode() + b"\r\n"
         b"\r\n"
     )
     return headers + body
+
+
+def add_version_header(resp_head):
+    """Insert the proxy version header after the status line of a relayed response, so
+    `curl -I` against the proxy reveals exactly which build is running."""
+    if not resp_head.startswith(b"HTTP/"):
+        return resp_head
+    status, _, rest = resp_head.partition(b"\r\n")
+    return status + b"\r\nX-SR203-Proxy-Version: " + __version__.encode() + b"\r\n" + rest
 
 
 def handle_client(client, target_host, target_port):
@@ -270,7 +282,7 @@ def handle_client(client, target_host, target_port):
         if is09:
             client.sendall(synth_http11(resp_body))
         else:
-            client.sendall(resp_head + resp_body)
+            client.sendall(add_version_header(resp_head) + resp_body)
     except Exception as e:  # noqa: BLE001 - best-effort proxy, log and move on
         try:
             msg = f"proxy error: {e}".encode()
@@ -307,7 +319,7 @@ def main():
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((lhost, lport))
     srv.listen(64)
-    print(f"SR203 proxy: http://{lhost}:{lport}/  ->  {thost}:{tport}")
+    print(f"SR203 proxy v{__version__}: http://{lhost}:{lport}/  ->  {thost}:{tport}")
     print("Browse to the listen URL and use the Sky Hub UI normally. Ctrl-C to stop.")
     try:
         while True:
