@@ -338,6 +338,14 @@ placeholder that the page's own JS fills in at submit time. The proxy understand
 and ignores the `0` placeholder, so it learns and stamps the real token on those pages
 too.
 
+Finally, as a robust catch-all, if a save *still* comes back as a "Session expired"
+page, the proxy reads the fresh token embedded in that page's refresh URL and
+**transparently resubmits the POST** once with it (`SR203_RETRY_EXPIRED=1`, on by
+default). The SR203 doesn't track the Digest nonce-count strictly, so reusing the
+browser's existing authentication for the retry works. This handles cases where the
+token is invalidated between page-load and submit for reasons that are hard to predict
+(e.g. certain firewall-rule flows) — you just see the save succeed.
+
 ### The proper fix
 
 The real defect is in the firmware: the write handlers should emit compliant HTTP

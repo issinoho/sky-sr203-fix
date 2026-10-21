@@ -26,7 +26,7 @@ import socket
 import sys
 import threading
 
-__version__ = "1.5.0"  # bump on release; shown at startup and in X-SR203-Proxy-Version
+__version__ = "1.6.0"  # bump on release; shown at startup and in X-SR203-Proxy-Version
 
 BUFSZ = 65536
 
@@ -36,6 +36,10 @@ BUFSZ = 65536
 # page. Since all router traffic flows through this proxy, we track the freshest key
 # the server has emitted and stamp it onto outgoing POSTs, closing the race.
 FIX_SESSIONKEY = os.environ.get("SR203_FIX_SESSIONKEY", "1") not in ("0", "false", "no")
+# If a POST still comes back as a "Session expired" page, the page embeds a fresh token
+# in its refresh URL. We transparently resubmit the POST with that token. The SR203 does
+# not track Digest nc strictly, so reusing the client's Authorization for the retry works.
+RETRY_EXPIRED = os.environ.get("SR203_RETRY_EXPIRED", "1") not in ("0", "false", "no")
 DEBUG = os.environ.get("SR203_DEBUG", "0") not in ("0", "false", "no")
 _LAST_KEY = None
 _LAST_KEY_LOCK = threading.Lock()
@@ -328,6 +332,24 @@ def handle_client(client, target_host, target_port):
         with socket.create_connection((target_host, target_port), timeout=20) as upstream:
             upstream.sendall(req_head + req_body)
             resp_head, resp_body, is09 = recv_http_message(upstream, is_request=False)
+
+        # Auto-retry: if the save still returns a "Session expired" page, it carries a
+        # fresh token in its refresh URL. Resubmit once with that token so the user never
+        # sees the error. Reuses the client's Authorization (the router accepts it).
+        if (RETRY_EXPIRED and is_post and b"sessionKey=" in req_body
+                and b"Session expired" in resp_body):
+            m = re.search(rb"sessionKey=(\d+)", resp_body)
+            if m:
+                fresh = m.group(1)
+                retry_body = _KEY_IN_BODY.sub(b"sessionKey=" + fresh, req_body)
+                if retry_body != req_body:
+                    retry_head = set_content_length(req_head, len(retry_body))
+                    dbg("auto-retry POST with fresh token", fresh.decode())
+                    with socket.create_connection((target_host, target_port), timeout=20) as up2:
+                        up2.sendall(retry_head + retry_body)
+                        resp_head, resp_body, is09 = recv_http_message(up2, is_request=False)
+                    dbg("auto-retry result:",
+                        "STILL EXPIRED" if b"Session expired" in resp_body else "OK")
 
         if DEBUG and is_post:
             expired = b"Session expired" in resp_body

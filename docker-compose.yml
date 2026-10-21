@@ -15,6 +15,9 @@ services:
       SR203_TARGET: "${ROUTER_ADDR:-192.168.0.1:80}"
       # Stamp the freshest sessionKey onto POSTs to kill the one-time "Session
       # expired" race. On by default; set to 0 to disable.
+      # Auto-resubmit a POST that still returns "Session expired", using the fresh
+      # token from the error page. The robust catch-all. On by default.
+      SR203_RETRY_EXPIRED: "${RETRY_EXPIRED:-1}"
       SR203_FIX_SESSIONKEY: "${FIX_SESSIONKEY:-1}"
       # Set to 1 to log per-request token decisions to the container logs (diagnostics).
       SR203_DEBUG: "${DEBUG:-0}"
