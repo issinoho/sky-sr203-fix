@@ -26,7 +26,7 @@ import socket
 import sys
 import threading
 
-__version__ = "1.6.0"  # bump on release; shown at startup and in X-SR203-Proxy-Version
+__version__ = "1.7.0"  # bump on release; shown at startup and in X-SR203-Proxy-Version
 
 BUFSZ = 65536
 

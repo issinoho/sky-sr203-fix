@@ -192,8 +192,8 @@ you'd previously tried changes that "failed", check them — some may have appli
 
 ## Option B — The Script
 
-`sr203.sh` makes changes directly via `curl`, bypassing the browser. Good for headless
-systems or scripting.
+`sr203.sh` makes changes directly via `curl`, bypassing the browser — blocked sites,
+Wi-Fi/admin passwords, and inbound firewall rules. Good for headless systems or scripting.
 
 **Prerequisites:** `bash` and `curl` (both standard on Linux/macOS; on Windows use WSL
 or Git Bash).
@@ -222,10 +222,33 @@ SR203 is `admin`.
 ./sr203.sh set-admin-password         # change the router admin password
 ./sr203.sh set-wifi-password          # change the Wi-Fi WPA2 passphrase
 
+./sr203.sh firewall-rule list                  # list inbound firewall rules (port forwards)
+./sr203.sh firewall-rule add <service> <lan-ip>  # add an inbound ALLOW rule for a defined Service
+./sr203.sh firewall-rule remove <service>      # remove an inbound rule by Service name
+
 ./sr203.sh get sky_wireless_settings.html          # fetch any admin page (inspection)
-./sr203.sh raw-post sky_<endpoint>.sky key=val ... # advanced: hand-crafted POST
+./sr203.sh raw-post <endpoint> [--form <page.html>] key=val ...  # advanced: hand-crafted POST
 ./sr203.sh --help
 ```
+
+**Inbound firewall rules** (`firewall-rule`) manage port forwards — mapping a predefined
+**Service** (set up under *Firewall > Services*) to a LAN IP:
+
+```bash
+./sr203.sh firewall-rule list
+./sr203.sh firewall-rule add SSH 192.168.0.80      # Service "SSH" must already exist
+./sr203.sh firewall-rule remove SSH
+```
+
+`add` creates an inbound *ALLOW from any WAN IP* rule (the common case); the Service
+defines the ports. `remove` deletes by Service name and **verifies** the rule is gone.
+Both re-read a fresh token immediately before submitting, so they're unaffected by the
+"Session expired" bug.
+
+**`raw-post`** is an escape hatch for endpoints the script doesn't wrap. It auto-resolves
+the form page that issues the token (or pass `--form <page.html>` explicitly) and reads
+the token robustly — including the `sessionID`-variable form used by the firewall pages.
+Supply your own `sessionKey=…` to skip the auto-fetch.
 
 **Password changes** prompt for the new value with no echo (or read it from an env var
 — `SR203_NEW_PW` for admin, `SR203_WIFI_PW` for Wi-Fi — never a command-line argument):

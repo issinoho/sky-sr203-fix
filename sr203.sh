@@ -19,8 +19,11 @@
 #   ./sr203.sh unblock-site <keyword>     # remove a blocked keyword
 #   ./sr203.sh set-admin-password         # change the router admin password (prompts; updates netrc)
 #   ./sr203.sh set-wifi-password          # change the Wi-Fi WPA2 passphrase (prompts; disconnects clients)
+#   ./sr203.sh firewall-rule list                     # list inbound firewall rules (port forwards)
+#   ./sr203.sh firewall-rule add <service> <lan-ip>   # add an inbound ALLOW rule for a defined Service
+#   ./sr203.sh firewall-rule remove <service>         # remove an inbound rule by Service name
 #   ./sr203.sh get <page.html>            # fetch any admin page (debug/inspection)
-#   ./sr203.sh raw-post <endpoint.sky> k=v [k=v ...]   # advanced: hand-crafted POST
+#   ./sr203.sh raw-post <endpoint> [--form <page.html>] k=v ...   # advanced: hand-crafted POST
 #
 # Passwords are read interactively (no terminal echo) or from an env var, never
 # as a command-line argument:  SR203_NEW_PW=... (admin), SR203_WIFI_PW=... (Wi-Fi).
@@ -36,6 +39,12 @@ NETRC="${SR203_NETRC:-$(dirname "$0")/.sr203_netrc}"
 BASE="http://${HOST}"
 
 die() { echo "error: $*" >&2; exit 1; }
+
+# --help / no args don't need credentials.
+case "${1:-}" in
+  ""|-h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
 [ -r "$NETRC" ] || die "netrc file not readable: $NETRC
   create it with:  umask 077; printf 'machine %s login admin password YOURPASS\\n' '$HOST' > '$NETRC'"
 
@@ -48,9 +57,29 @@ _post() { # _post <endpoint> <--data-urlencode args...> -> raw response body on 
   curl -s -m 15 --http0.9 --digest --netrc-file "$NETRC" "$@" "${BASE}/${ep}"
 }
 
-# Pull the per-render anti-CSRF token from a form page.
+# Extract the anti-CSRF token from a page's HTML (read on stdin). The token appears
+# either as a JS variable (var sessionID = '123'; on the firewall-rules pages, where
+# the hidden field is a value="0" placeholder) or as a hidden field value (everywhere
+# else). Zeros are ignored so we never pick up a placeholder.
+_extract_key() {
+  local html; html="$(cat)"
+  { printf '%s' "$html" | grep -oiE "sessionID *= *'[0-9]+'" | grep -oE '[0-9]+'
+    printf '%s' "$html" | grep -oiE 'name="sessionKey" value="[0-9]+"' | grep -oE '[0-9]+'
+  } 2>/dev/null | grep -vxE '0' | head -1
+}
+
+# Pull the per-render token from a form page.
 _session_key() { # _session_key <form_page>
-  _get "$1" | grep -oiE 'name="sessionKey" value="[0-9]+"' | grep -oE '[0-9]+' | head -1
+  _get "$1" | _extract_key
+}
+
+# Read a hidden field's value from a page's HTML. Handles both attribute orders
+# (name-before-value and value-before-name — the firmware mixes them).
+_hidden_val() { # _hidden_val <html> <field-name>
+  local html="$1" name="$2" v
+  v="$(printf '%s' "$html" | grep -oiE "name=\"$name\" value=\"[^\"]*\"" | sed -E 's/.*value="([^"]*)".*/\1/' | head -1)"
+  [ -n "$v" ] && { printf '%s' "$v"; return; }
+  printf '%s' "$html" | grep -oiE "value=\"[^\"]*\" name=\"$name\"" | sed -E 's/value="([^"]*)".*/\1/' | head -1
 }
 
 # ---- block-sites (sky_blocksite.sky) --------------------------------------
@@ -84,7 +113,7 @@ _blocksite_post() {
   local addact="$1" remact="$2" kwadd="$3" kwrem="$4" urlset_override="${5:-}"
   local page key urlset
   page="$(_get "$PAGE")"
-  key="$(printf '%s' "$page" | grep -oiE 'name="sessionKey" value="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
+  key="$(printf '%s' "$page" | _extract_key)"
   [ -n "$key" ] || die "could not read sessionKey (auth problem?)"
   if [ -n "$urlset_override" ]; then
     urlset="$urlset_override"
@@ -169,7 +198,7 @@ cmd_set_admin_password() {
 
   local page key timeout
   page="$(_get sky_set_password.html)"
-  key="$(printf '%s' "$page" | grep -oiE 'name="sessionKey" value="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
+  key="$(printf '%s' "$page" | _extract_key)"
   [ -n "$key" ] || die "could not read sessionKey (auth problem?)"
   timeout="$(printf '%s' "$page" | grep -oiE 'name="sessionIdleTimeout"[^>]*value="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
   : "${timeout:=5}"
@@ -203,7 +232,7 @@ cmd_set_wifi_password() {
 
   local page key mode
   page="$(_get sky_wireless_password.html)"
-  key="$(printf '%s' "$page" | grep -oiE 'name="sessionKey" value="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
+  key="$(printf '%s' "$page" | _extract_key)"
   [ -n "$key" ] || die "could not read sessionKey (auth problem?)"
   mode="$(printf '%s' "$page" | grep -oiE "var sky_wlAuthMode *= *'[^']*'" | sed -E "s/.*'([^']*)'.*/\1/")"
   case "$mode" in
@@ -235,16 +264,159 @@ cmd_set_wifi_password() {
   fi
 }
 
+# ---- inbound firewall rules (sky_firewall_rules.cmd) -----------------------
+# Inbound rules (a.k.a. port forwards) map a predefined Service to a LAN IP. The
+# add form lives on sky_firewall_rules-in.html (token in `var sessionID`), the list
+# and delete on sky_firewall_rules.html (token in the hidden field).
+FWPAGE="sky_firewall_rules.html"
+FWADD="sky_firewall_rules-in.html"
+FWEP="sky_firewall_rules.cmd"
+
+# Fetch the firewall rules page, verifying it's the real page (retry transient fetches).
+_fw_page() {
+  local html i
+  for i in 1 2 3; do
+    html="$(_get "$FWPAGE")"
+    case "$html" in *'name="fwrules"'*) printf '%s' "$html"; return 0 ;; esac
+  done
+  die "could not fetch the firewall rules page (auth/connection problem?)"
+}
+
+# Emit the inbound rule rows as TSV: service<TAB>action<TAB>lan<TAB>wan
+_fw_rows() {
+  _fw_page | sed 's/<tr>/\n<tr>/g' | grep -i 'name="in_sel"' | while IFS= read -r row; do
+    local svc spans
+    svc="$(printf '%s' "$row" | grep -oiE 'value="[^"]*" name="in_sel"' | sed -E 's/value="([^"]*)".*/\1/')"
+    # spans in order: index, service, action, LAN, WAN, log
+    spans="$(printf '%s' "$row" | grep -oE '<span class="thead">[^<]*</span>' | sed -E 's/<[^>]*>//g')"
+    local action lan wan
+    action="$(printf '%s\n' "$spans" | sed -n '3p')"
+    lan="$(printf '%s\n' "$spans" | sed -n '4p')"
+    wan="$(printf '%s\n' "$spans" | sed -n '5p')"
+    printf '%s\t%s\t%s\t%s\n' "$svc" "$action" "$lan" "$wan"
+  done
+}
+
+cmd_fw_list() {
+  local rows; rows="$(_fw_rows)"
+  if [ -z "$rows" ]; then echo "(no inbound firewall rules)"; return; fi
+  printf '%-20s %-14s %-24s %s\n' "SERVICE" "ACTION" "LAN TARGET" "WAN SOURCE"
+  printf '%s\n' "$rows" | while IFS=$'\t' read -r svc action lan wan; do
+    printf '%-20s %-14s %-24s %s\n' "$svc" "$action" "$lan" "$wan"
+  done
+}
+
+cmd_fw_add() {
+  local svc="${1:?usage: firewall-rule add <service> <lan-ip>}" ip="${2:?usage: firewall-rule add <service> <lan-ip>}"
+  case "$ip" in
+    *.*.*.*) : ;;
+    *) die "lan-ip must be an IPv4 address like 192.168.0.50" ;;
+  esac
+  local o1 o2 o3 o4; IFS=. read -r o1 o2 o3 o4 <<<"$ip"
+  for o in "$o1" "$o2" "$o3" "$o4"; do
+    case "$o" in ''|*[!0-9]*) die "invalid IPv4 address: $ip" ;; esac
+    [ "$o" -le 255 ] || die "invalid IPv4 address: $ip"
+  done
+  local key; key="$(_session_key "$FWADD")"
+  [ -n "$key" ] || die "could not read sessionKey (auth problem?)"
+  # Mirrors exactly what the web form submits for an inbound ALLOW rule from any WAN IP.
+  _post "$FWEP" \
+    --data-urlencode "service_list=${svc}" --data-urlencode "h_service_list=${svc}" \
+    --data-urlencode "fw_action=2" --data-urlencode "h_fw_action=2" \
+    --data-urlencode "fw_waniptype=anyip" --data-urlencode "h_fw_waniptype=anyip" \
+    --data-urlencode "fw_logging=0" --data-urlencode "h_fw_logging=0" \
+    --data-urlencode "lan_start_ip1=${o1}" --data-urlencode "lan_start_ip2=${o2}" \
+    --data-urlencode "lan_start_ip3=${o3}" --data-urlencode "lan_start_ip4=${o4}" \
+    --data-urlencode "c4_lan_start_ip=${ip}" \
+    --data-urlencode "c4_wan_start_ip=0.0.0.0" --data-urlencode "c4_wan_finish_ip=0.0.0.0" \
+    --data-urlencode "fw_direction=1" --data-urlencode "fw_ip_version=4" \
+    --data-urlencode "h_ruleSelect=" --data-urlencode "edit=0" \
+    --data-urlencode "fwall_action=add" --data-urlencode "todo=save" \
+    --data-urlencode "sessionKey=${key}" \
+    --data-urlencode "this_file=sky_firewall_rules-in.html" --data-urlencode "next_file=sky_firewall_rules.html" \
+    >/dev/null
+  if _fw_rows | cut -f1 | grep -qxF "$svc"; then
+    echo "added inbound rule: $svc -> $ip"
+  else
+    die "rule did not appear (is '$svc' a defined Service on the router?)"
+  fi
+}
+
+cmd_fw_remove() {
+  local svc="${1:?usage: firewall-rule remove <service>}"
+  local page; page="$(_fw_page)"
+  # 0-based index of the rule among inbound rules (what selected_index_edit_delete wants)
+  local idx; idx="$(printf '%s' "$page" | sed 's/<tr>/\n<tr>/g' | grep -i 'name="in_sel"' \
+    | grep -oiE 'value="[^"]*" name="in_sel"' | sed -E 's/value="([^"]*)".*/\1/' \
+    | grep -nxF "$svc" | head -1 | cut -d: -f1)"
+  [ -n "$idx" ] || die "no inbound rule named '$svc' (try: firewall-rule list)"
+  idx=$((idx - 1))
+  local cnt; cnt="$(_hidden_val "$page" inboundRuleCnt)"
+  case "$cnt" in ''|*[!0-9]*) die "could not read inbound rule count; aborting delete" ;; esac
+  local key; key="$(printf '%s' "$page" | _extract_key)"
+  [ -n "$key" ] || die "could not read sessionKey (auth problem?)"
+  # preserve current firewall toggles so we don't change them
+  _post "$FWEP" \
+    --data-urlencode "fwall_action=remove" --data-urlencode "todo=delete" \
+    --data-urlencode "selected_index_edit_delete=${idx}" \
+    --data-urlencode "in_sel=${svc}" --data-urlencode "h_in_sel=${svc}" \
+    --data-urlencode "h_ip_version=4" \
+    --data-urlencode "inboundRuleCnt=${cnt}" \
+    --data-urlencode "in_enable=$(_hidden_val "$page" in_enable)" \
+    --data-urlencode "out_enable=$(_hidden_val "$page" out_enable)" \
+    --data-urlencode "outboundRuleCnt=$(_hidden_val "$page" outboundRuleCnt)" \
+    --data-urlencode "ipv6firewallenable=$(_hidden_val "$page" ipv6firewallenable)" \
+    --data-urlencode "ipsecfirewallenable=$(_hidden_val "$page" ipsecfirewallenable)" \
+    --data-urlencode "icmpv6echoreqallow=$(_hidden_val "$page" icmpv6echoreqallow)" \
+    --data-urlencode "sessionKey=${key}" \
+    --data-urlencode "this_file=sky_firewall_rules.html" --data-urlencode "next_file=sky_firewall_rules.html" \
+    >/dev/null
+  if _fw_rows | cut -f1 | grep -qxF "$svc"; then
+    die "rule '$svc' still present (removal may have failed)"
+  else
+    echo "removed inbound rule: $svc"
+  fi
+}
+
+cmd_firewall_rule() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    list)   cmd_fw_list "$@" ;;
+    add)    cmd_fw_add "$@" ;;
+    remove) cmd_fw_remove "$@" ;;
+    *) die "usage: firewall-rule list | add <service> <lan-ip> | remove <service>" ;;
+  esac
+}
+
 # ---- generic helpers ------------------------------------------------------
 cmd_get() { _get "${1:?usage: get <page.html>}"; }
 
+# Map a write endpoint to the form page that carries its token (best-effort).
+_form_page_for() {
+  case "$1" in
+    sky_blocksite.sky)        echo "sky_block_sites.html" ;;
+    sky_firewall_rules.cmd)   echo "sky_firewall_rules-in.html" ;;
+    sky_password.scgi)        echo "sky_set_password.html" ;;
+    sky_wireless_update.cmd)  echo "sky_wireless_password.html" ;;
+    *.sky|*.cmd|*.scgi)       echo "${1%.*}.html" ;;   # fallback guess
+    *)                        echo "" ;;
+  esac
+}
+
 cmd_raw_post() {
-  local ep="${1:?usage: raw-post <endpoint.sky> k=v [k=v ...]}"; shift
-  local page key args=()
-  page="$(_get "${ep%.sky}.html" 2>/dev/null || true)"
-  key="$(printf '%s' "$page" | grep -oiE 'name="sessionKey" value="[0-9]+"' | grep -oE '[0-9]+' | head -1)"
-  [ -n "$key" ] && args+=(--data-urlencode "sessionKey=${key}")
-  for kv in "$@"; do args+=(--data-urlencode "$kv"); done
+  local ep="${1:?usage: raw-post <endpoint> [--form <page.html>] k=v [k=v ...]}"; shift
+  local form="" args=() have_key=""
+  if [ "${1:-}" = "--form" ]; then form="$2"; shift 2; fi
+  [ -n "$form" ] || form="$(_form_page_for "$ep")"
+  for kv in "$@"; do
+    case "$kv" in sessionKey=*) have_key=1 ;; esac
+    args+=(--data-urlencode "$kv")
+  done
+  # only fetch/stamp a token if the caller didn't supply one
+  if [ -z "$have_key" ] && [ -n "$form" ]; then
+    local key; key="$(_session_key "$form" 2>/dev/null || true)"
+    [ -n "$key" ] && args+=(--data-urlencode "sessionKey=${key}")
+  fi
   _post "$ep" "${args[@]}"
 }
 
@@ -255,9 +427,8 @@ case "${1:-}" in
   unblock-site)       shift; cmd_unblock_site "$@" ;;
   set-admin-password) shift; cmd_set_admin_password "$@" ;;
   set-wifi-password)  shift; cmd_set_wifi_password "$@" ;;
+  firewall-rule)      shift; cmd_firewall_rule "$@" ;;
   get)                shift; cmd_get "$@" ;;
   raw-post)           shift; cmd_raw_post "$@" ;;
-  ""|-h|--help)
-    sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command: $1  (try --help)" ;;
 esac
