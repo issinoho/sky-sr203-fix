@@ -20,13 +20,16 @@ Then browse to  http://127.0.0.1:8099/  and use the UI normally.
 Stop with Ctrl-C. Stdlib only; no external dependencies.
 """
 import argparse
+import html
 import os
 import re
 import socket
 import sys
 import threading
+import urllib.parse
+import time
 
-__version__ = "1.7.1"  # bump on release; shown at startup and in X-SR203-Proxy-Version
+__version__ = "1.7.2"  # bump on release; shown at startup and in X-SR203-Proxy-Version
 
 BUFSZ = 65536
 
@@ -43,11 +46,20 @@ RETRY_EXPIRED = os.environ.get("SR203_RETRY_EXPIRED", "1") not in ("0", "false",
 DEBUG = os.environ.get("SR203_DEBUG", "0") not in ("0", "false", "no")
 _LAST_KEY = None
 _LAST_KEY_LOCK = threading.Lock()
+# POSTs that only *open* a form (they change nothing), mapped to the page whose token
+# they need. The router answers these with a dropped connection, not "Session
+# expired", when the token is stale (e.g. another tab or device loaded a router page
+# in between). The proxy can't fetch a fresh token itself (Digest auth is bound to
+# the URI), so it hands the browser a tiny page that reloads the token page in the
+# background, then resubmits the form once.
+_SAFE_TO_RESEND = {b"/sky_services_custom-edit.scgi": "/sky_services.html"}
+_RESUBMIT_MARK = b"_sr203_resubmit=1"
 
 
 def dbg(*a):
     if DEBUG:
-        sys.stderr.write("[sr203] " + " ".join(str(x) for x in a) + "\n")
+        ts = time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
+        sys.stderr.write(f"[sr203 {ts}] " + " ".join(str(x) for x in a) + "\n")
         sys.stderr.flush()
 
 
@@ -317,6 +329,28 @@ def synth_http11(body):
     return headers + body
 
 
+def _resubmit_page(path, body, token_page):
+    """A page that reloads `token_page` (so the proxy learns the current token), then
+    re-posts the original form fields once, marked so we never loop."""
+    fields = "".join(
+        f'<input type="hidden" name="{html.escape(k)}" value="{html.escape(v)}">'
+        for k, v in urllib.parse.parse_qsl(body.decode(errors="replace"), keep_blank_values=True)
+    )
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>Retrying…</title></head>
+<body><p>The router dropped that request; refreshing the session and retrying…</p>
+<form id="f" method="post" action="{html.escape(path.decode())}">{fields}
+<input type="hidden" name="_sr203_resubmit" value="1"></form>
+<script>
+fetch({token_page!r}, {{cache: "no-store", credentials: "same-origin"}})
+  .then(function (r) {{ return r.text(); }})
+  .then(function (t) {{
+    var m = t.match(/(?:sessionKey|sessionID)\\s*=\\s*'(\\d+)'/);
+    if (m && document.forms.f.sessionKey) document.forms.f.sessionKey.value = m[1];
+  }})
+  .finally(function () {{ document.forms.f.submit(); }});
+</script></body></html>""".encode()
+
+
 def add_version_header(resp_head):
     """Insert the proxy version header after the status line of a relayed response, so
     `curl -I` against the proxy reveals exactly which build is running."""
@@ -342,7 +376,17 @@ def handle_client(client, target_host, target_port):
                     "| cookie=", _header(req_head, "cookie") or "-",
                     "| xrw=", _header(req_head, "x-requested-with") or "-",
                     "| auth:", _auth_summary(req_head))
+                for line in req_head.split(b"\r\n")[1:]:
+                    if not line:
+                        continue
+                    shown = (b"Authorization: " + _auth_summary(req_head).encode()
+                             if line.lower().startswith(b"authorization:") else line)
+                    dbg("   hdr:", shown.decode(errors="replace"))
                 dbg("   req body:", _redact(req_body).decode(errors="replace")[:1000])
+        path = req_head.split(b" ", 2)[1].split(b"?", 1)[0] if b" " in req_head else b""
+        resubmitted = is_post and _RESUBMIT_MARK in req_body
+        if resubmitted:
+            req_body = req_body.replace(b"&" + _RESUBMIT_MARK, b"").replace(_RESUBMIT_MARK, b"")
         req_head = rewrite_request_head(req_head, target_host)
         req_head, req_body = maybe_fix_sessionkey(req_head, req_body)
         # Always forward with explicit Content-Length framing (head rewrite stripped
@@ -355,30 +399,40 @@ def handle_client(client, target_host, target_port):
             upstream.sendall(req_head + req_body)
             resp_head, resp_body, is09 = recv_http_message(upstream, is_request=False)
         if not resp_head and not resp_body:
+            if is_post and path in _SAFE_TO_RESEND and not resubmitted:
+                log(f"router dropped {path.decode()} (likely stale token); "
+                    "asking the browser to refresh the token and resubmit")
+                client.sendall(synth_http11(_resubmit_page(path, req_body, _SAFE_TO_RESEND[path])))
+                return
             raise ConnectionError("router closed the connection without replying")
 
         # Auto-retry: if the save still returns a "Session expired" page, it carries a
-        # fresh token in its refresh URL. Resubmit once with that token so the user never
-        # sees the error. Reuses the client's Authorization (the router accepts it).
-        if (RETRY_EXPIRED and is_post and b"sessionKey=" in req_body
-                and b"Session expired" in resp_body):
+        # fresh token in its refresh URL. Resubmit with that token so the user never
+        # sees the error; the firewall-rules pages sometimes need more than one go.
+        # Reuses the client's Authorization (the router accepts it).
+        attempt = 0
+        while (RETRY_EXPIRED and is_post and attempt < 3 and b"sessionKey=" in req_body
+               and b"Session expired" in resp_body):
             m = re.search(rb"sessionKey=(\d+)", resp_body)
-            if m:
-                fresh = m.group(1)
-                retry_body = _KEY_IN_BODY.sub(b"sessionKey=" + fresh, req_body)
-                if retry_body != req_body:
-                    retry_head = set_content_length(req_head, len(retry_body))
-                    dbg("auto-retry POST with fresh token", fresh.decode())
-                    try:
-                        with socket.create_connection((target_host, target_port), timeout=20) as up2:
-                            up2.sendall(retry_head + retry_body)
-                            r = recv_http_message(up2, is_request=False)
-                        if r[0] or r[1]:  # keep the original reply if the retry got nothing
-                            resp_head, resp_body, is09 = r
-                    except OSError as e:
-                        log(f"auto-retry failed ({e!r}); returning the original reply")
-                    dbg("auto-retry result:",
-                        "STILL EXPIRED" if b"Session expired" in resp_body else "OK")
+            if not m:
+                break
+            attempt += 1
+            fresh = m.group(1)
+            req_body = _KEY_IN_BODY.sub(b"sessionKey=" + fresh, req_body)
+            req_head = set_content_length(req_head, len(req_body))
+            dbg(f"auto-retry {attempt}/3 POST with fresh token", fresh.decode())
+            try:
+                with socket.create_connection((target_host, target_port), timeout=20) as up2:
+                    up2.sendall(req_head + req_body)
+                    r = recv_http_message(up2, is_request=False)
+            except OSError as e:
+                log(f"auto-retry failed ({e!r}); returning the last reply")
+                break
+            if not (r[0] or r[1]):  # keep the last reply if the retry got nothing
+                break
+            resp_head, resp_body, is09 = r
+            dbg("auto-retry result:",
+                "STILL EXPIRED" if b"Session expired" in resp_body else "OK")
 
         if DEBUG and is_post:
             expired = b"Session expired" in resp_body
