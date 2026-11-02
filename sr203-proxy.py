@@ -26,7 +26,7 @@ import socket
 import sys
 import threading
 
-__version__ = "1.7.0"  # bump on release; shown at startup and in X-SR203-Proxy-Version
+__version__ = "1.7.1"  # bump on release; shown at startup and in X-SR203-Proxy-Version
 
 BUFSZ = 65536
 
@@ -49,6 +49,12 @@ def dbg(*a):
     if DEBUG:
         sys.stderr.write("[sr203] " + " ".join(str(x) for x in a) + "\n")
         sys.stderr.flush()
+
+
+def log(msg):
+    """Always-on one-line error log (stderr ends up in docker logs / journalctl)."""
+    sys.stderr.write("[sr203] " + msg + "\n")
+    sys.stderr.flush()
 
 
 # Redact credential-bearing fields before logging a request body.
@@ -81,11 +87,15 @@ def _auth_summary(head):
 # The token appears in three forms depending on the page:
 #   - a JS variable:  var sessionID = '12345';   (firewall-rules pages; the hidden
 #     field there is just a value="0" placeholder the JS overwrites at submit)
+#     or  var sessionKey = '12345';   (services page; hidden fields are value="")
 #   - a hidden field: name="sessionKey" value="12345"   (block-sites, wireless, …)
 #   - a refresh URL:  ...?sessionKey=12345   (the "Session expired" page)
+# Missing a page's token is harmful: we'd stamp an older page's key over the right
+# one, and some endpoints (sky_services_custom-edit.scgi) then just drop the
+# connection instead of returning "Session expired".
 # We must prefer the real value and IGNORE the "0" placeholder — learning "0" and
 # stamping it onto a POST is itself what breaks the firewall-rules pages.
-_KEY_IN_JS = re.compile(rb"sessionID\s*=\s*'(\d+)'")
+_KEY_IN_JS = re.compile(rb"(?:sessionID|sessionKey)\s*=\s*'(\d+)'")
 _KEY_IN_HTML = re.compile(rb'name="sessionKey"\s+value="(\d+)"', re.I)
 _KEY_IN_URL = re.compile(rb'[?&]sessionKey=(\d+)')
 _KEY_IN_BODY = re.compile(rb'sessionKey=\d+')
@@ -105,6 +115,17 @@ def _note_server_key(body):
         dbg("learned sessionKey", _LAST_KEY.decode(), "candidates=", [c.decode() for c in cands])
 
 
+def _recv(sock):
+    """recv() that treats a TCP reset as end-of-stream. The SR203 often resets the
+    connection right after writing its reply (it closes without draining the
+    request), so a reset must not discard the bytes we already received."""
+    try:
+        return sock.recv(BUFSZ)
+    except ConnectionResetError:
+        dbg("peer reset the connection; treating as EOF")
+        return b""
+
+
 def recv_http_message(sock, is_request):
     """Read one HTTP message (request or response) from sock.
 
@@ -115,7 +136,7 @@ def recv_http_message(sock, is_request):
     data = b""
     # Read until we have the full header block, or the peer closes.
     while b"\r\n\r\n" not in data:
-        chunk = sock.recv(BUFSZ)
+        chunk = _recv(sock)
         if not chunk:
             break
         data += chunk
@@ -125,7 +146,7 @@ def recv_http_message(sock, is_request):
         if not is_request and len(data) >= 5 and not data.startswith(b"HTTP/"):
             # Router's HTTP/0.9 reply: no headers at all. Drain to EOF = body.
             while True:
-                chunk = sock.recv(BUFSZ)
+                chunk = _recv(sock)
                 if not chunk:
                     break
                 data += chunk
@@ -162,7 +183,7 @@ def recv_http_message(sock, is_request):
         body = _read_chunked_body(sock, body)
     elif content_length is not None:
         while len(body) < content_length:
-            chunk = sock.recv(BUFSZ)
+            chunk = _recv(sock)
             if not chunk:
                 break
             body += chunk
@@ -171,7 +192,7 @@ def recv_http_message(sock, is_request):
         # (the router delimits with Connection: close).
         if not is_request:
             while True:
-                chunk = sock.recv(BUFSZ)
+                chunk = _recv(sock)
                 if not chunk:
                     break
                 body += chunk
@@ -185,7 +206,7 @@ def _read_chunked_body(sock, buf):
     out = b""
     while True:
         while b"\r\n" not in buf:
-            more = sock.recv(BUFSZ)
+            more = _recv(sock)
             if not more:
                 return out
             buf += more
@@ -198,7 +219,7 @@ def _read_chunked_body(sock, buf):
         if n == 0:
             return out  # last chunk; ignore any trailers
         while len(buf) < n + 2:  # chunk data + trailing CRLF
-            more = sock.recv(BUFSZ)
+            more = _recv(sock)
             if not more:
                 break
             buf += more
@@ -306,6 +327,7 @@ def add_version_header(resp_head):
 
 
 def handle_client(client, target_host, target_port):
+    req_head = b""
     try:
         req_head, req_body, _ = recv_http_message(client, is_request=True)
         if not req_head:
@@ -332,6 +354,8 @@ def handle_client(client, target_host, target_port):
         with socket.create_connection((target_host, target_port), timeout=20) as upstream:
             upstream.sendall(req_head + req_body)
             resp_head, resp_body, is09 = recv_http_message(upstream, is_request=False)
+        if not resp_head and not resp_body:
+            raise ConnectionError("router closed the connection without replying")
 
         # Auto-retry: if the save still returns a "Session expired" page, it carries a
         # fresh token in its refresh URL. Resubmit once with that token so the user never
@@ -345,9 +369,14 @@ def handle_client(client, target_host, target_port):
                 if retry_body != req_body:
                     retry_head = set_content_length(req_head, len(retry_body))
                     dbg("auto-retry POST with fresh token", fresh.decode())
-                    with socket.create_connection((target_host, target_port), timeout=20) as up2:
-                        up2.sendall(retry_head + retry_body)
-                        resp_head, resp_body, is09 = recv_http_message(up2, is_request=False)
+                    try:
+                        with socket.create_connection((target_host, target_port), timeout=20) as up2:
+                            up2.sendall(retry_head + retry_body)
+                            r = recv_http_message(up2, is_request=False)
+                        if r[0] or r[1]:  # keep the original reply if the retry got nothing
+                            resp_head, resp_body, is09 = r
+                    except OSError as e:
+                        log(f"auto-retry failed ({e!r}); returning the original reply")
                     dbg("auto-retry result:",
                         "STILL EXPIRED" if b"Session expired" in resp_body else "OK")
 
@@ -366,6 +395,8 @@ def handle_client(client, target_host, target_port):
         else:
             client.sendall(add_version_header(resp_head) + resp_body)
     except Exception as e:  # noqa: BLE001 - best-effort proxy, log and move on
+        first = req_head.split(b"\r\n", 1)[0].decode(errors="replace") if req_head else "?"
+        log(f"error handling '{first}': {e!r}")
         try:
             msg = f"proxy error: {e}".encode()
             client.sendall(synth_http11(b"<html><body>" + msg + b"</body></html>"))
