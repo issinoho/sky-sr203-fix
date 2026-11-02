@@ -61,11 +61,14 @@ hardware, and nothing is actually wrong with your "session":
    and the server returns the "Session expired" page — which then reloads the form
    with a fresh token, which is why a **retry often works**. On some pages (the
    firewall-rules pages) the token can even go stale in ways that are hard to predict.
+   And one handler, **Edit Service** (`sky_services_custom-edit.scgi`), doesn't send
+   "Session expired" at all: it just closes the connection, which the browser shows
+   as **"The connection was reset"**.
 
 Browsers used to tolerate the old behaviours; as they tightened up, the bugs became
 visible. The proxy addresses all of this — repairing the HTTP/0.9 replies, keeping the
 token fresh, and, as a catch-all, **automatically resubmitting with a fresh token** if a
-save still comes back "expired". For the gory details see [How it works](#how-it-works).
+save still comes back "expired" (or, for Edit Service, if the router drops the request). For the gory details see [How it works](#how-it-works).
 
 **Affected model:** developed and verified on the **SR203**. Other Sky Hubs that use
 the same `sky_router` web firmware may behave identically — reports welcome (open an
@@ -119,7 +122,7 @@ first time.
 | `ROUTER_ADDR` | `192.168.0.1:80` | Your Sky Hub's address (the default for Sky) |
 | `FIX_SESSIONKEY` | `1` | Stamp the fresh session token onto saves (leave on) |
 | `RETRY_EXPIRED` | `1` | Auto-resubmit a save that still returns "expired" (leave on) |
-| `DEBUG` | `0` | Set to `1` to log per-request token decisions to the container logs |
+| `DEBUG` | `0` | Set to `1` to log per-request token decisions, POST headers and timestamps to the container logs (no passwords) |
 
 Manage it with:
 ```bash
@@ -300,6 +303,13 @@ Supply your own `sessionKey=…` to skip the auto-fetch.
   redeploy (`docker compose up -d --build --force-recreate`) and hard-refresh the
   browser. If it persists on a page, set `DEBUG=1`, reproduce, and open an issue with the
   `[sr203]` log lines (they contain only numeric tokens, no password).
+- **"The connection was reset" or "proxy error: router closed the connection without
+  replying".** The router dropped the request without answering. On **Edit Service**
+  that means a stale token, and v1.7.2+ recovers automatically (you may see a brief
+  "retrying…" page). If you see it on an older build, upgrade. If you see it on
+  another page, reload the page and try again, then report it with a `DEBUG=1` log.
+  Proxy errors are always written to `docker logs sr203-proxy` / `journalctl -u
+  sr203-proxy`, even without `DEBUG`.
 - **Browser can't reach the proxy.** Check the host's firewall allows the port, and
   that you started it with `--listen 0.0.0.0:8099` (not `127.0.0.1`) if browsing from
   another device.
@@ -367,17 +377,30 @@ save.
 
 Note that some pages (the **firewall-rules** pages) carry the real token in a
 JavaScript variable (`var sessionID = '…'`) and leave the hidden field as a `value="0"`
-placeholder that the page's own JS fills in at submit time. The proxy understands this
-and ignores the `0` placeholder, so it learns and stamps the real token on those pages
-too.
+placeholder that the page's own JS fills in at submit time. The **Services** page does
+the same with `var sessionKey = '…'` and an empty hidden field. The proxy understands
+both forms and ignores placeholders, so it learns and stamps the real token on those
+pages too. (Missing one is harmful: the proxy would stamp an older page's token over
+the right one.)
 
 Finally, as a robust catch-all, if a save *still* comes back as a "Session expired"
 page, the proxy reads the fresh token embedded in that page's refresh URL and
-**transparently resubmits the POST** once with it (`SR203_RETRY_EXPIRED=1`, on by
-default). The SR203 doesn't track the Digest nonce-count strictly, so reusing the
+**transparently resubmits the POST** with it, up to 3 times (`SR203_RETRY_EXPIRED=1`,
+on by default). The SR203 doesn't track the Digest nonce-count strictly, so reusing the
 browser's existing authentication for the retry works. This handles cases where the
 token is invalidated between page-load and submit for reasons that are hard to predict
 (e.g. certain firewall-rule flows) — you just see the save succeed.
+
+**Edit Service is a special case.** Clicking *Edit Service* POSTs to
+`sky_services_custom-edit.scgi`, which only opens the edit form. Given a stale token
+it doesn't return "Session expired"; it closes the connection with no reply. The token
+is shared by everything talking to the router, so a page load in another tab or on
+another device is enough to make yours stale. The proxy can't fetch a fresh token
+itself, because Digest auth is tied to the exact URL and it only has the browser's
+credentials for the edit request. Instead it replies with a small "retrying…" page that
+reloads `sky_services.html` in the background (so the proxy learns the current token)
+and resubmits the form once. It does this only for requests that change nothing: a
+save that gets dropped is never resent, because the router may already have applied it.
 
 ### The proper fix
 
